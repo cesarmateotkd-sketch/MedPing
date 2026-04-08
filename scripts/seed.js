@@ -2,7 +2,7 @@
 require('dotenv').config();
 
 const pool = require('../src/db');
-const { scheduleReminder } = require('../src/queues/reminderQueue');
+const { reminderQueue, scheduleReminder } = require('../src/queues/reminderQueue');
 
 const TEST_PATIENT = {
   name:     'Alice Johnson',
@@ -88,8 +88,9 @@ async function seed() {
     client.release();
   }
 
-  // Give BullMQ a moment to flush, then exit.
-  setTimeout(() => process.exit(0), 500);
+  // Close all connections cleanly so the process exits naturally.
+  await reminderQueue.close();
+  await pool.end();
 }
 
 seed().catch((err) => {

@@ -1,6 +1,7 @@
 'use strict';
 const express      = require('express');
 const router       = express.Router();
+const rateLimit    = require('express-rate-limit');
 const twilio       = require('twilio');
 const config       = require('../config');
 const pool         = require('../db');
@@ -21,8 +22,24 @@ function twiml(message) {
 }
 
 /**
+ * Rate limit by the sender's phone number (From field in Twilio body).
+ * Falls back to IP when From is not yet parsed. The urlencoded parser in
+ * app.js runs before all routes so req.body is populated here.
+ */
+const smsLimiter = rateLimit({
+  windowMs: 60 * 1000,    // 1-minute window
+  max:      20,           // max 20 inbound messages per phone per minute
+  keyGenerator: (req) => req.body?.From || req.ip,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  handler: (_req, res) =>
+    res.status(429).type('text/xml').send(twiml('Too many requests. Please wait a moment.')),
+});
+
+/**
  * Validate the Twilio request signature.
  * Set SKIP_TWILIO_VALIDATION=true in .env for local testing without ngrok.
+ * Never set it in production.
  */
 function validateTwilioSignature(req, res, next) {
   if (process.env.SKIP_TWILIO_VALIDATION === 'true') {
@@ -53,6 +70,7 @@ function validateTwilioSignature(req, res, next) {
 // ---------------------------------------------------------------------------
 router.post(
   '/inbound',
+  smsLimiter,
   validateTwilioSignature,
   asyncHandler(async (req, res) => {
     const from    = req.body.From || '';
@@ -110,13 +128,13 @@ router.post(
       return res.type('text/xml').send(
         twiml(
           'MedPing commands:\n' +
-          'Y or YES  — mark last reminder as taken\n' +
+          'Y or YES    — mark last reminder as taken\n' +
           'S or SNOOZE — remind again in 15 min\n' +
-          'N or NO   — mark as skipped\n' +
-          'STATUS    — view today\'s schedule\n' +
-          'STOP      — unsubscribe\n' +
-          'START     — re-subscribe\n' +
-          'H         — show this help'
+          'N or NO     — mark as skipped\n' +
+          'STATUS      — view today\'s schedule\n' +
+          'STOP        — unsubscribe\n' +
+          'START       — re-subscribe\n' +
+          'H           — show this help'
         )
       );
     }
@@ -153,7 +171,7 @@ router.post(
         (m) => `${m.reminder_time} ${m.name} ${m.dose}: ${m.today_status}`
       );
       return res.type('text/xml').send(
-        twiml(`Today\'s medications:\n${lines.join('\n')}`)
+        twiml(`Today's medications:\n${lines.join('\n')}`)
       );
     }
 
@@ -177,9 +195,10 @@ router.post(
       );
     }
 
-    const log       = logResult.rows[0];
-    const weekStart = getWeekStart();
-    let reply       = '';
+    const log = logResult.rows[0];
+    // Use the patient's timezone so the week boundary matches their local calendar.
+    const weekStart = getWeekStart(patient.timezone);
+    let reply = '';
 
     if (cmd === 'Y' || cmd === 'YES') {
       await pool.query(
@@ -196,7 +215,7 @@ router.post(
         `UPDATE reminder_logs SET status = 'snoozed' WHERE id = $1`,
         [log.id]
       );
-      // One-time delayed job — not a repeating job
+      // One-time delayed job — not a repeating job.
       await reminderQueue.add(
         'send-reminder',
         { patientId: patient.id, medicationId: log.medication_id },

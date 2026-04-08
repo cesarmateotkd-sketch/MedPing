@@ -1,6 +1,5 @@
 'use strict';
-require('dotenv').config();
-
+// dotenv is loaded by src/config/index.js — no duplicate call needed here.
 const express = require('express');
 const config  = require('./config');
 

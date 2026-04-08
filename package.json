@@ -11,18 +11,26 @@
     "dev": "nodemon src/app.js",
     "worker": "node src/queues/reminderWorker.js",
     "migrate": "node scripts/migrate.js",
-    "seed": "node scripts/seed.js"
+    "seed": "node scripts/seed.js",
+    "test": "jest --runInBand"
   },
   "dependencies": {
     "bullmq": "^5.4.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
     "ioredis": "^5.3.2",
     "libphonenumber-js": "^1.11.1",
     "pg": "^8.12.0",
     "twilio": "^5.3.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.4",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"]
   }
 }

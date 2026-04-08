@@ -37,14 +37,6 @@ const worker = new Worker(
     const patient    = patientResult.rows[0];
     const medication = medResult.rows[0];
 
-    // Insert reminder log
-    const logResult = await pool.query(
-      `INSERT INTO reminder_logs (patient_id, medication_id, status)
-       VALUES ($1, $2, 'awaiting')
-       RETURNING id`,
-      [patientId, medicationId]
-    );
-
     // Build SMS body
     let body = `MedPing: Time to take ${medication.name} ${medication.dose}.`;
     if (medication.food_note) {
@@ -52,7 +44,17 @@ const worker = new Worker(
     }
     body += ' Reply Y=Taken, S=Snooze 15min, N=Skip, H=Help';
 
+    // Send SMS FIRST — if this fails the job retries without creating an orphaned log.
     await sendSMS(patient.phone, body);
+
+    // Insert the log only after a confirmed SMS delivery to avoid duplicate
+    // awaiting logs when BullMQ retries a failed job.
+    const logResult = await pool.query(
+      `INSERT INTO reminder_logs (patient_id, medication_id, status)
+       VALUES ($1, $2, 'awaiting')
+       RETURNING id`,
+      [patientId, medicationId]
+    );
 
     console.log(
       `[worker] Sent reminder to ${patient.phone} — ${medication.name} ` +
@@ -69,6 +71,25 @@ worker.on('completed', (job) => {
 worker.on('failed', (job, err) => {
   console.error(`[worker] Job ${job?.id} failed:`, err.message);
 });
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown — drain in-flight jobs before exit
+// ---------------------------------------------------------------------------
+async function shutdown(signal) {
+  console.log(`[worker] ${signal} received — shutting down gracefully...`);
+  try {
+    await worker.close();      // waits for active jobs to finish
+    await connection.quit();   // close Redis connection cleanly
+    await pool.end();          // close PostgreSQL pool
+    console.log('[worker] Shutdown complete');
+  } catch (err) {
+    console.error('[worker] Error during shutdown:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 console.log('[worker] Reminder worker started');
 

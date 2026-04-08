@@ -5,9 +5,17 @@ const pool         = require('../db');
 const { cancelReminder } = require('../queues/reminderQueue');
 const asyncHandler       = require('../helpers/asyncHandler');
 
+function parseId(str) {
+  const n = parseInt(str, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 // DELETE /medications/:id  (soft-delete — sets active = FALSE)
 router.delete('/:id', asyncHandler(async (req, res) => {
-  const medicationId = parseInt(req.params.id, 10);
+  const medicationId = parseId(req.params.id);
+  if (!medicationId) {
+    return res.status(400).json({ error: 'Invalid medication ID' });
+  }
 
   const result = await pool.query(
     `UPDATE medications
