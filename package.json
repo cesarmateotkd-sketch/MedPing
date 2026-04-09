@@ -12,7 +12,10 @@
     "worker": "node src/queues/reminderWorker.js",
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "docker:up": "docker-compose up --build",
+    "docker:seed": "docker-compose --profile seed run --rm seed",
+    "docker:down": "docker-compose down"
   },
   "dependencies": {
     "bullmq": "^5.4.3",

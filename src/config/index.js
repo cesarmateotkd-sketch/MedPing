@@ -7,10 +7,13 @@ function requireEnv(name) {
   return val;
 }
 
+// When SMS_MOCK=true, Twilio credentials are not required.
+const smsMock = process.env.SMS_MOCK === 'true';
+
 module.exports = {
-  TWILIO_ACCOUNT_SID:   requireEnv('TWILIO_ACCOUNT_SID'),
-  TWILIO_AUTH_TOKEN:    requireEnv('TWILIO_AUTH_TOKEN'),
-  TWILIO_PHONE_NUMBER:  requireEnv('TWILIO_PHONE_NUMBER'),
+  TWILIO_ACCOUNT_SID:   smsMock ? 'mock' : requireEnv('TWILIO_ACCOUNT_SID'),
+  TWILIO_AUTH_TOKEN:    smsMock ? 'mock' : requireEnv('TWILIO_AUTH_TOKEN'),
+  TWILIO_PHONE_NUMBER:  smsMock ? '+15550000000' : requireEnv('TWILIO_PHONE_NUMBER'),
   DATABASE_URL:         requireEnv('DATABASE_URL'),
   REDIS_URL:            requireEnv('REDIS_URL'),
 
