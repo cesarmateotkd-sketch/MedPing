@@ -2,6 +2,7 @@
 // config loads dotenv — must come before any other src/ module.
 const config = require('./config');
 const express    = require('express');
+const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
 const pool       = require('./db');
 const logger     = require('./helpers/logger');
@@ -9,6 +10,11 @@ const asyncHandler = require('./helpers/asyncHandler');
 const { connection: redisConnection } = require('./queues/reminderQueue');
 
 const app = express();
+
+// ---------------------------------------------------------------------------
+// Security headers
+// ---------------------------------------------------------------------------
+app.use(helmet());
 
 // ---------------------------------------------------------------------------
 // Body parsers

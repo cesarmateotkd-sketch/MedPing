@@ -42,6 +42,10 @@ router.post('/', requireApiKey, asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'name and phone are required' });
   }
 
+  if (typeof name !== 'string' || name.length > 255) {
+    return res.status(400).json({ error: 'name must be 1–255 characters' });
+  }
+
   if (!isValidTimezone(timezone)) {
     return res.status(400).json({ error: `Invalid timezone "${timezone}" — must be a valid IANA timezone` });
   }
@@ -195,6 +199,10 @@ router.post('/:id/caregivers', requireApiKey, asyncHandler(async (req, res) => {
 
   const { name, phone, relationship, threshold = 3 } = req.body;
   if (!name || !phone) return res.status(400).json({ error: 'name and phone are required' });
+
+  if (typeof name !== 'string' || name.length > 255) {
+    return res.status(400).json({ error: 'name must be 1–255 characters' });
+  }
 
   const thresholdNum = parseInt(threshold, 10);
   if (!Number.isInteger(thresholdNum) || thresholdNum < 1) {

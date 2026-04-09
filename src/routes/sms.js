@@ -43,6 +43,11 @@ const smsLimiter = rateLimit({
  */
 function validateTwilioSignature(req, res, next) {
   if (process.env.SKIP_TWILIO_VALIDATION === 'true') {
+    if (process.env.NODE_ENV === 'production') {
+      logger.error('SKIP_TWILIO_VALIDATION is enabled in production — rejecting request');
+      return res.status(500).type('text/xml').send(twiml('Server misconfiguration.'));
+    }
+    logger.warn('Twilio signature validation skipped (development only)');
     return next();
   }
 
@@ -79,7 +84,7 @@ router.post(
       [from]
     );
     if (patientResult.rows.length === 0) {
-      return res.type('text/xml').send(twiml('Your number is not registered with MedPing.'));
+      return res.type('text/xml').send(twiml('Thank you for contacting MedPing. If you have questions, please contact your care provider.'));
     }
 
     const patient = patientResult.rows[0];

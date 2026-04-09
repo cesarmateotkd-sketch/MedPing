@@ -50,7 +50,7 @@ test('unknown phone returns not-registered message', async () => {
   pool.query.mockResolvedValueOnce({ rows: [] });
   const res = await post({ Body: 'Y' });
   expect(res.status).toBe(200);
-  expect(res.text).toContain('not registered');
+  expect(res.text).toContain('Thank you for contacting MedPing');
 });
 
 test('STOP disables reminders', async () => {

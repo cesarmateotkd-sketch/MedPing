@@ -57,7 +57,6 @@ const worker = new Worker(
       patientId,
       medicationId,
       logId: logResult.rows[0].id,
-      medication: medication.name,
     });
   },
   { connection }
