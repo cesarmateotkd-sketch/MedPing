@@ -57,7 +57,7 @@ function validateTwilioSignature(req, res, next) {
   const url   = `${proto}://${host}${req.originalUrl}`;
 
   if (!twilio.validateRequest(config.TWILIO_AUTH_TOKEN, signature, url, req.body)) {
-    logger.warn('Invalid Twilio signature', { ip: req.ip, url });
+    logger.warn('Invalid Twilio signature', { ip: req.ip });
     return res.status(403).type('text/xml').send(twiml('Forbidden'));
   }
   next();
