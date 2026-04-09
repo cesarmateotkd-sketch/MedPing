@@ -1,0 +1,1506 @@
+openapi: 3.0.3
+info:
+  title: MedPing REST API
+  version: 1.0.0
+  description: >
+    MedPing is a medication-reminder and adherence-tracking service.
+    Patients receive SMS reminders via Twilio and can reply to confirm,
+    snooze, or skip doses. Caregivers are alerted when adherence falls
+    below a configurable threshold.
+
+    All REST endpoints except `GET /health` and `POST /sms/inbound`
+    require an `X-API-Key` header. The SMS inbound webhook is secured
+    by Twilio request-signature validation instead.
+
+    Rate limit: 120 requests per minute per IP for all REST endpoints.
+  contact:
+    name: MedPing Support
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Static API key issued to each authorized client. Pass as the
+        `X-API-Key` request header on every call except `GET /health`
+        and `POST /sms/inbound`.
+
+  # -------------------------------------------------------------------------
+  # Reusable schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    # -- Domain models -------------------------------------------------------
+
+    Patient:
+      type: object
+      description: A registered patient enrolled in medication reminders.
+      required:
+        - id
+        - name
+        - phone
+        - timezone
+        - reminders_active
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Unique patient identifier.
+          example: 42
+        name:
+          type: string
+          maxLength: 255
+          description: Full name of the patient.
+          example: "Jane Doe"
+        phone:
+          type: string
+          description: Normalized E.164 phone number.
+          example: "+14155550101"
+        timezone:
+          type: string
+          description: IANA timezone identifier used for scheduling reminders.
+          example: "America/New_York"
+        reminders_active:
+          type: boolean
+          description: >
+            Whether scheduled SMS reminders are currently enabled.
+            Patients can pause reminders by replying STOP and resume by
+            replying START.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when the patient record was created.
+          example: "2024-03-15T09:00:00.000Z"
+
+    Medication:
+      type: object
+      description: A medication assigned to a patient with a daily reminder schedule.
+      required:
+        - id
+        - patient_id
+        - name
+        - dose
+        - reminder_time
+        - active
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Unique medication identifier.
+          example: 7
+        patient_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: ID of the patient this medication belongs to.
+          example: 42
+        name:
+          type: string
+          description: Medication name.
+          example: "Metformin"
+        dose:
+          type: string
+          description: Dose description (e.g. "500 mg").
+          example: "500 mg"
+        reminder_time:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: Daily reminder time in HH:MM (24-hour) format, interpreted in the patient's timezone.
+          example: "08:00"
+        food_note:
+          type: string
+          nullable: true
+          description: Optional instruction relating to food (e.g. "Take with food").
+          example: "Take with food"
+        active:
+          type: boolean
+          description: >
+            Whether the medication is active. Deletion is a soft-delete that
+            sets this field to false and cancels the BullMQ reminder job.
+          example: true
+
+    Caregiver:
+      type: object
+      description: A caregiver who receives alerts when a patient misses doses.
+      required:
+        - id
+        - patient_id
+        - name
+        - phone
+        - threshold
+        - active
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Unique caregiver identifier.
+          example: 3
+        patient_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: ID of the patient this caregiver is associated with.
+          example: 42
+        name:
+          type: string
+          maxLength: 255
+          description: Full name of the caregiver.
+          example: "John Doe"
+        phone:
+          type: string
+          description: Normalized E.164 phone number for SMS alerts.
+          example: "+14155550102"
+        relationship:
+          type: string
+          nullable: true
+          description: Optional description of the caregiver's relationship to the patient.
+          example: "Spouse"
+        threshold:
+          type: integer
+          minimum: 1
+          description: Number of consecutive missed doses before an alert is sent.
+          example: 3
+        active:
+          type: boolean
+          description: >
+            Whether this caregiver is active. Deletion is a soft-delete that
+            sets this field to false.
+          example: true
+
+    TodayScheduleItem:
+      type: object
+      description: A single medication entry in today's reminder schedule.
+      required:
+        - id
+        - name
+        - dose
+        - reminder_time
+        - today_status
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 7
+        name:
+          type: string
+          example: "Metformin"
+        dose:
+          type: string
+          example: "500 mg"
+        reminder_time:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          example: "08:00"
+        food_note:
+          type: string
+          nullable: true
+          example: "Take with food"
+        today_status:
+          type: string
+          enum:
+            - pending
+            - awaiting
+            - confirmed
+            - snoozed
+            - skipped
+          description: The most recent reminder-log status for this medication today, or "pending" if no reminder has been sent yet.
+          example: "confirmed"
+
+    WeeklyAdherence:
+      type: object
+      description: Aggregated weekly adherence percentage for a patient.
+      required:
+        - week_start
+        - pct
+      properties:
+        week_start:
+          type: string
+          format: date
+          description: ISO 8601 date of the Monday that starts this week.
+          example: "2024-03-11"
+        pct:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: Percentage of scheduled doses confirmed as taken for this week.
+          example: 85.7
+
+    QueueCounts:
+      type: object
+      description: BullMQ job counts across all queue states.
+      required:
+        - waiting
+        - active
+        - completed
+        - failed
+        - delayed
+        - repeatable
+      properties:
+        waiting:
+          type: integer
+          minimum: 0
+          example: 2
+        active:
+          type: integer
+          minimum: 0
+          example: 1
+        completed:
+          type: integer
+          minimum: 0
+          example: 1048
+        failed:
+          type: integer
+          minimum: 0
+          example: 3
+        delayed:
+          type: integer
+          minimum: 0
+          example: 5
+        repeatable:
+          type: integer
+          minimum: 0
+          description: Number of registered repeatable (cron) jobs.
+          example: 12
+
+    RepeatableJob:
+      type: object
+      description: A BullMQ repeatable cron job for a medication reminder.
+      required:
+        - id
+        - pattern
+        - tz
+        - next
+      properties:
+        id:
+          type: string
+          description: BullMQ job key for the repeatable job.
+          example: "reminder:42:7"
+        pattern:
+          type: string
+          description: Cron expression that drives this job.
+          example: "0 8 * * *"
+        tz:
+          type: string
+          description: IANA timezone the cron pattern is evaluated in.
+          example: "America/New_York"
+        next:
+          type: integer
+          format: int64
+          description: Unix timestamp (ms) of the next scheduled execution.
+          example: 1710493200000
+
+    FailedJob:
+      type: object
+      description: A summary of a failed BullMQ reminder job.
+      required:
+        - id
+        - data
+        - reason
+        - attempts
+        - finished_at
+      properties:
+        id:
+          type: string
+          description: BullMQ job ID.
+          example: "1234"
+        data:
+          type: object
+          description: Original job payload.
+          properties:
+            patientId:
+              type: integer
+              example: 42
+            medicationId:
+              type: integer
+              example: 7
+        reason:
+          type: string
+          description: Error message from the most recent failure.
+          example: "Twilio rate-limit exceeded"
+        attempts:
+          type: integer
+          minimum: 0
+          description: Number of execution attempts made.
+          example: 3
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO 8601 timestamp of when the job was last finalized, or null if not yet resolved.
+          example: "2024-03-15T08:01:05.000Z"
+
+    # -- Request bodies -------------------------------------------------------
+
+    CreatePatientRequest:
+      type: object
+      required:
+        - name
+        - phone
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          description: Full name of the patient (1–255 characters).
+          example: "Jane Doe"
+        phone:
+          type: string
+          description: Patient phone number in E.164 or a recognized local format. Stored normalized to E.164.
+          example: "+14155550101"
+        timezone:
+          type: string
+          description: IANA timezone identifier. Defaults to "UTC" when omitted.
+          default: "UTC"
+          example: "America/New_York"
+
+    UpdatePatientRequest:
+      type: object
+      description: At least one field must be provided.
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          description: Updated patient name.
+          example: "Jane M. Doe"
+        timezone:
+          type: string
+          description: Updated IANA timezone identifier.
+          example: "America/Chicago"
+
+    CreateMedicationRequest:
+      type: object
+      required:
+        - name
+        - dose
+        - reminder_time
+      properties:
+        name:
+          type: string
+          description: Medication name.
+          example: "Metformin"
+        dose:
+          type: string
+          description: Dose description.
+          example: "500 mg"
+        reminder_time:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: Daily reminder time in HH:MM (24-hour) format.
+          example: "08:00"
+        food_note:
+          type: string
+          nullable: true
+          description: Optional food-related instruction.
+          example: "Take with food"
+
+    UpdateMedicationRequest:
+      type: object
+      description: >
+        At least one field must be provided. `food_note` may be explicitly
+        set to `null` to clear a previously stored value.
+      properties:
+        name:
+          type: string
+          description: Updated medication name.
+          example: "Metformin XR"
+        dose:
+          type: string
+          description: Updated dose description.
+          example: "1000 mg"
+        reminder_time:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: Updated daily reminder time in HH:MM format. Reschedules the BullMQ cron job.
+          example: "09:00"
+        food_note:
+          type: string
+          nullable: true
+          description: Updated food note. Pass `null` to clear.
+          example: null
+
+    CreateCaregiverRequest:
+      type: object
+      required:
+        - name
+        - phone
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          description: Full name of the caregiver (1–255 characters).
+          example: "John Doe"
+        phone:
+          type: string
+          description: Caregiver phone number in E.164 or a recognized local format.
+          example: "+14155550102"
+        relationship:
+          type: string
+          nullable: true
+          description: Optional relationship to the patient.
+          example: "Spouse"
+        threshold:
+          type: integer
+          minimum: 1
+          description: Consecutive missed doses before alerting this caregiver. Defaults to 3.
+          default: 3
+          example: 3
+
+    PatchCaregiverRequest:
+      type: object
+      description: At least one field must be provided.
+      properties:
+        threshold:
+          type: integer
+          minimum: 1
+          description: Updated consecutive-miss threshold.
+          example: 5
+        active:
+          type: boolean
+          description: Set to true to reactivate a previously deactivated caregiver.
+          example: true
+
+    # -- Response envelopes ---------------------------------------------------
+
+    PaginatedPatients:
+      type: object
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Patient'
+        meta:
+          type: object
+          required:
+            - page
+            - limit
+            - total
+          properties:
+            page:
+              type: integer
+              minimum: 1
+              example: 1
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 100
+              example: 20
+            total:
+              type: integer
+              minimum: 0
+              description: Total number of patients across all pages.
+              example: 137
+
+    PatientDashboard:
+      type: object
+      required:
+        - patient
+        - today_schedule
+        - weekly_adherence
+      properties:
+        patient:
+          type: object
+          required:
+            - id
+            - name
+            - phone
+            - timezone
+            - reminders_active
+          properties:
+            id:
+              type: integer
+              format: int64
+              minimum: 1
+              example: 42
+            name:
+              type: string
+              example: "Jane Doe"
+            phone:
+              type: string
+              example: "+14155550101"
+            timezone:
+              type: string
+              example: "America/New_York"
+            reminders_active:
+              type: boolean
+              example: true
+        today_schedule:
+          type: array
+          items:
+            $ref: '#/components/schemas/TodayScheduleItem'
+        weekly_adherence:
+          type: array
+          maxItems: 4
+          description: Up to 4 most recent weekly adherence records, newest first.
+          items:
+            $ref: '#/components/schemas/WeeklyAdherence'
+
+    QueueStatus:
+      type: object
+      required:
+        - counts
+        - repeatable_jobs
+        - recent_failures
+      properties:
+        counts:
+          $ref: '#/components/schemas/QueueCounts'
+        repeatable_jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RepeatableJob'
+        recent_failures:
+          type: array
+          maxItems: 20
+          description: Up to 20 most recent failed jobs.
+          items:
+            $ref: '#/components/schemas/FailedJob'
+
+    RetryResult:
+      type: object
+      required:
+        - retried
+      properties:
+        retried:
+          type: integer
+          minimum: 0
+          description: Number of failed jobs re-queued.
+          example: 3
+
+    DeactivateMedicationResponse:
+      type: object
+      required:
+        - message
+        - medication
+      properties:
+        message:
+          type: string
+          example: "Medication deactivated"
+        medication:
+          $ref: '#/components/schemas/Medication'
+
+    DeactivateCaregiverResponse:
+      type: object
+      required:
+        - message
+        - caregiver
+      properties:
+        message:
+          type: string
+          example: "Caregiver deactivated"
+        caregiver:
+          $ref: '#/components/schemas/Caregiver'
+
+    # -- Error responses ------------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable description of the error.
+          example: "name and phone are required"
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Unauthorized"
+
+    BadRequest:
+      description: The request body or query parameters are invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "name and phone are required"
+
+    NotFound:
+      description: The requested resource was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Patient not found"
+
+    Conflict:
+      description: A unique-constraint violation — a resource with this identifier already exists.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "A patient with this phone number already exists"
+
+    ServiceUnavailable:
+      description: One or more upstream dependencies (PostgreSQL or Redis) are unreachable.
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - status
+              - checks
+              - ts
+            properties:
+              status:
+                type: string
+                enum:
+                  - ok
+                  - degraded
+                example: "degraded"
+              checks:
+                type: object
+                properties:
+                  postgres:
+                    type: string
+                    enum:
+                      - ok
+                      - error
+                    example: "error"
+                  redis:
+                    type: string
+                    enum:
+                      - ok
+                      - error
+                    example: "ok"
+              ts:
+                type: string
+                format: date-time
+                example: "2024-03-15T09:00:00.000Z"
+
+  # -------------------------------------------------------------------------
+  # Reusable parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    PatientId:
+      name: id
+      in: path
+      required: true
+      description: Unique patient ID (positive integer).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 42
+
+    MedicationId:
+      name: id
+      in: path
+      required: true
+      description: Unique medication ID (positive integer).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 7
+
+    CaregiverId:
+      name: id
+      in: path
+      required: true
+      description: Unique caregiver ID (positive integer).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 3
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+tags:
+  - name: Health
+    description: Service health and dependency liveness checks.
+  - name: Patients
+    description: >
+      Patient registration and management. A patient is the central
+      entity; all medications and caregivers belong to a patient.
+  - name: Medications
+    description: >
+      Medication lifecycle operations. Creating a medication automatically
+      schedules a daily BullMQ reminder cron job if the patient has
+      reminders enabled.
+  - name: Caregivers
+    description: >
+      Caregiver management. Caregivers receive SMS alerts when a
+      patient's consecutive skipped doses reaches the caregiver's
+      configured threshold.
+  - name: Admin
+    description: >
+      Administrative operations for the BullMQ reminder queue. Use
+      these endpoints to inspect queue health and recover from
+      delivery failures.
+  - name: SMS
+    description: >
+      Twilio inbound SMS webhook. This endpoint is called by Twilio
+      and is not intended for direct API consumers. It is secured via
+      Twilio request-signature validation rather than API key auth.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+
+  # --------------------------------------------------------------------------
+  # GET /health
+  # --------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: getHealth
+      tags:
+        - Health
+      summary: Check service health
+      description: >
+        Returns the liveness status of the MedPing service along with
+        individual connectivity checks for PostgreSQL and Redis. Returns
+        HTTP 200 when both dependencies are reachable, 503 when either is
+        not. This endpoint is intentionally unauthenticated so that load
+        balancers and orchestrators can poll it freely.
+      security: []
+      responses:
+        '200':
+          description: All dependencies are healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - checks
+                  - ts
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - ok
+                      - degraded
+                    example: "ok"
+                  checks:
+                    type: object
+                    properties:
+                      postgres:
+                        type: string
+                        enum:
+                          - ok
+                          - error
+                        example: "ok"
+                      redis:
+                        type: string
+                        enum:
+                          - ok
+                          - error
+                        example: "ok"
+                  ts:
+                    type: string
+                    format: date-time
+                    example: "2024-03-15T09:00:00.000Z"
+              example:
+                status: "ok"
+                checks:
+                  postgres: "ok"
+                  redis: "ok"
+                ts: "2024-03-15T09:00:00.000Z"
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --------------------------------------------------------------------------
+  # GET /patients
+  # --------------------------------------------------------------------------
+  /patients:
+    get:
+      operationId: listPatients
+      tags:
+        - Patients
+      summary: List all patients
+      description: >
+        Returns a paginated list of all patients ordered by ID ascending.
+        Page size is capped at 100 records per request.
+      parameters:
+        - name: page
+          in: query
+          required: false
+          description: Page number to retrieve. Minimum 1. Defaults to 1.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          example: 1
+        - name: limit
+          in: query
+          required: false
+          description: Number of records per page. Range 1–100. Defaults to 20.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          example: 20
+      responses:
+        '200':
+          description: Paginated list of patients.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPatients'
+              example:
+                data:
+                  - id: 42
+                    name: "Jane Doe"
+                    phone: "+14155550101"
+                    timezone: "America/New_York"
+                    reminders_active: true
+                    created_at: "2024-03-15T09:00:00.000Z"
+                meta:
+                  page: 1
+                  limit: 20
+                  total: 137
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    # ------------------------------------------------------------------------
+    # POST /patients
+    # ------------------------------------------------------------------------
+    post:
+      operationId: createPatient
+      tags:
+        - Patients
+      summary: Create a patient
+      description: >
+        Registers a new patient. The phone number is normalized to E.164
+        format and must be unique across all patients. Timezone defaults
+        to "UTC" if not supplied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePatientRequest'
+            example:
+              name: "Jane Doe"
+              phone: "+14155550101"
+              timezone: "America/New_York"
+      responses:
+        '201':
+          description: Patient created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Patient'
+              example:
+                id: 42
+                name: "Jane Doe"
+                phone: "+14155550101"
+                timezone: "America/New_York"
+                reminders_active: true
+                created_at: "2024-03-15T09:00:00.000Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # --------------------------------------------------------------------------
+  # PUT /patients/:id
+  # --------------------------------------------------------------------------
+  /patients/{id}:
+    put:
+      operationId: updatePatient
+      tags:
+        - Patients
+      summary: Update a patient
+      description: >
+        Updates the patient's name and/or timezone. At least one field must
+        be provided. Only the supplied fields are modified; omitted fields
+        retain their existing values.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePatientRequest'
+            example:
+              timezone: "America/Chicago"
+      responses:
+        '200':
+          description: Patient updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Patient'
+              example:
+                id: 42
+                name: "Jane Doe"
+                phone: "+14155550101"
+                timezone: "America/Chicago"
+                reminders_active: true
+                created_at: "2024-03-15T09:00:00.000Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # POST /patients/:id/medications
+  # --------------------------------------------------------------------------
+  /patients/{id}/medications:
+    post:
+      operationId: addMedication
+      tags:
+        - Medications
+      summary: Add a medication to a patient
+      description: >
+        Creates a new medication record for the specified patient and, if the
+        patient's reminders are active, immediately schedules a daily BullMQ
+        cron job to send an SMS reminder at the specified time in the patient's
+        timezone.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMedicationRequest'
+            example:
+              name: "Metformin"
+              dose: "500 mg"
+              reminder_time: "08:00"
+              food_note: "Take with food"
+      responses:
+        '201':
+          description: Medication created and reminder job scheduled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Medication'
+              example:
+                id: 7
+                patient_id: 42
+                name: "Metformin"
+                dose: "500 mg"
+                reminder_time: "08:00"
+                food_note: "Take with food"
+                active: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # POST /patients/:id/caregivers
+  # --------------------------------------------------------------------------
+  /patients/{id}/caregivers:
+    post:
+      operationId: addCaregiver
+      tags:
+        - Caregivers
+      summary: Add a caregiver to a patient
+      description: >
+        Registers a caregiver for the specified patient. The caregiver will
+        receive an SMS alert when the patient's consecutive skipped doses
+        reaches the configured threshold.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCaregiverRequest'
+            example:
+              name: "John Doe"
+              phone: "+14155550102"
+              relationship: "Spouse"
+              threshold: 3
+      responses:
+        '201':
+          description: Caregiver created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Caregiver'
+              example:
+                id: 3
+                patient_id: 42
+                name: "John Doe"
+                phone: "+14155550102"
+                relationship: "Spouse"
+                threshold: 3
+                active: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    # ------------------------------------------------------------------------
+    # GET /patients/:id/caregivers
+    # ------------------------------------------------------------------------
+    get:
+      operationId: listCaregivers
+      tags:
+        - Caregivers
+      summary: List caregivers for a patient
+      description: Returns all caregiver records (active and inactive) for the specified patient, ordered by ID ascending.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      responses:
+        '200':
+          description: Array of caregiver records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Caregiver'
+              example:
+                - id: 3
+                  patient_id: 42
+                  name: "John Doe"
+                  phone: "+14155550102"
+                  relationship: "Spouse"
+                  threshold: 3
+                  active: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # GET /patients/:id/dashboard
+  # --------------------------------------------------------------------------
+  /patients/{id}/dashboard:
+    get:
+      operationId: getPatientDashboard
+      tags:
+        - Patients
+      summary: Get patient dashboard
+      description: >
+        Returns a consolidated view of the patient's profile, today's
+        medication schedule with the current reminder status for each
+        active medication, and up to four weeks of historical adherence
+        percentages (newest week first).
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      responses:
+        '200':
+          description: Patient dashboard data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatientDashboard'
+              example:
+                patient:
+                  id: 42
+                  name: "Jane Doe"
+                  phone: "+14155550101"
+                  timezone: "America/New_York"
+                  reminders_active: true
+                today_schedule:
+                  - id: 7
+                    name: "Metformin"
+                    dose: "500 mg"
+                    reminder_time: "08:00"
+                    food_note: "Take with food"
+                    today_status: "confirmed"
+                  - id: 8
+                    name: "Lisinopril"
+                    dose: "10 mg"
+                    reminder_time: "20:00"
+                    food_note: null
+                    today_status: "pending"
+                weekly_adherence:
+                  - week_start: "2024-03-11"
+                    pct: 85.7
+                  - week_start: "2024-03-04"
+                    pct: 100.0
+                  - week_start: "2024-02-26"
+                    pct: 71.4
+                  - week_start: "2024-02-19"
+                    pct: 92.9
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # DELETE /medications/:id
+  # --------------------------------------------------------------------------
+  /medications/{id}:
+    delete:
+      operationId: deleteMedication
+      tags:
+        - Medications
+      summary: Deactivate a medication
+      description: >
+        Soft-deletes the medication by setting `active = false` and cancels
+        the associated BullMQ reminder cron job. The record is retained in
+        the database for adherence-history purposes.
+      parameters:
+        - $ref: '#/components/parameters/MedicationId'
+      responses:
+        '200':
+          description: Medication deactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeactivateMedicationResponse'
+              example:
+                message: "Medication deactivated"
+                medication:
+                  id: 7
+                  patient_id: 42
+                  name: "Metformin"
+                  dose: "500 mg"
+                  reminder_time: "08:00"
+                  food_note: "Take with food"
+                  active: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    # ------------------------------------------------------------------------
+    # PUT /medications/:id
+    # ------------------------------------------------------------------------
+    put:
+      operationId: updateMedication
+      tags:
+        - Medications
+      summary: Update a medication
+      description: >
+        Updates one or more fields of an active medication. At least one
+        field must be provided. If `reminder_time` changes and the patient's
+        reminders are active, the BullMQ cron job is automatically rescheduled
+        to the new time. `food_note` may be set to `null` explicitly to clear
+        a previously stored value. Inactive (soft-deleted) medications return 404.
+      parameters:
+        - $ref: '#/components/parameters/MedicationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMedicationRequest'
+            example:
+              reminder_time: "09:00"
+              dose: "1000 mg"
+      responses:
+        '200':
+          description: Medication updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Medication'
+              example:
+                id: 7
+                patient_id: 42
+                name: "Metformin"
+                dose: "1000 mg"
+                reminder_time: "09:00"
+                food_note: "Take with food"
+                active: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Medication not found or is inactive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Medication not found or inactive"
+
+  # --------------------------------------------------------------------------
+  # DELETE /caregivers/:id
+  # --------------------------------------------------------------------------
+  /caregivers/{id}:
+    delete:
+      operationId: deleteCaregiver
+      tags:
+        - Caregivers
+      summary: Deactivate a caregiver
+      description: >
+        Soft-deletes the caregiver record by setting `active = false`. The
+        caregiver will no longer receive alerts. The record is retained for
+        audit purposes.
+      parameters:
+        - $ref: '#/components/parameters/CaregiverId'
+      responses:
+        '200':
+          description: Caregiver deactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeactivateCaregiverResponse'
+              example:
+                message: "Caregiver deactivated"
+                caregiver:
+                  id: 3
+                  patient_id: 42
+                  name: "John Doe"
+                  phone: "+14155550102"
+                  relationship: "Spouse"
+                  threshold: 3
+                  active: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    # ------------------------------------------------------------------------
+    # PATCH /caregivers/:id
+    # ------------------------------------------------------------------------
+    patch:
+      operationId: patchCaregiver
+      tags:
+        - Caregivers
+      summary: Update a caregiver
+      description: >
+        Partially updates a caregiver record. Supports updating the missed-dose
+        `threshold` and toggling the `active` flag (use `active: true` to
+        reactivate a previously deactivated caregiver). At least one field
+        must be provided.
+      parameters:
+        - $ref: '#/components/parameters/CaregiverId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchCaregiverRequest'
+            example:
+              threshold: 5
+      responses:
+        '200':
+          description: Caregiver updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Caregiver'
+              example:
+                id: 3
+                patient_id: 42
+                name: "John Doe"
+                phone: "+14155550102"
+                relationship: "Spouse"
+                threshold: 5
+                active: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # GET /admin/queue
+  # --------------------------------------------------------------------------
+  /admin/queue:
+    get:
+      operationId: getQueueStatus
+      tags:
+        - Admin
+      summary: Get reminder queue status
+      description: >
+        Returns BullMQ job counts across all queue states (waiting, active,
+        completed, failed, delayed, repeatable), the full list of registered
+        repeatable cron jobs, and the 20 most recent failed jobs with their
+        error details. Use this endpoint to monitor reminder delivery health.
+      responses:
+        '200':
+          description: Queue status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueStatus'
+              example:
+                counts:
+                  waiting: 2
+                  active: 1
+                  completed: 1048
+                  failed: 3
+                  delayed: 5
+                  repeatable: 12
+                repeatable_jobs:
+                  - id: "reminder:42:7"
+                    pattern: "0 8 * * *"
+                    tz: "America/New_York"
+                    next: 1710493200000
+                recent_failures:
+                  - id: "1234"
+                    data:
+                      patientId: 42
+                      medicationId: 7
+                    reason: "Twilio rate-limit exceeded"
+                    attempts: 3
+                    finished_at: "2024-03-15T08:01:05.000Z"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------------------
+  # POST /admin/queue/retry-failed
+  # --------------------------------------------------------------------------
+  /admin/queue/retry-failed:
+    post:
+      operationId: retryFailedJobs
+      tags:
+        - Admin
+      summary: Retry all failed jobs
+      description: >
+        Re-queues every job currently in the BullMQ failed state. This is
+        a bulk recovery operation; individual job retry is not exposed. Returns
+        the count of jobs that were re-queued.
+      requestBody:
+        required: false
+        description: No request body required.
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Failed jobs re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryResult'
+              example:
+                retried: 3
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------------------
+  # POST /sms/inbound
+  # --------------------------------------------------------------------------
+  /sms/inbound:
+    post:
+      operationId: smsInbound
+      tags:
+        - SMS
+      summary: Receive inbound SMS from Twilio
+      description: >
+        Twilio webhook endpoint that handles inbound SMS messages from
+        patients. Authentication is handled via Twilio request-signature
+        validation (the `X-Twilio-Signature` header) rather than API key
+        auth. Do not call this endpoint directly.
+
+        Supported patient commands:
+
+        | Command | Action |
+        |---------|--------|
+        | `Y` or `YES` | Mark the most recent awaiting dose as confirmed (taken). |
+        | `S` or `SNOOZE` | Snooze the most recent awaiting reminder by 15 minutes. |
+        | `N` or `NO` | Mark the most recent awaiting dose as skipped. |
+        | `STATUS` | Reply with today's full medication schedule and statuses. |
+        | `STOP` | Unsubscribe from all reminders (`reminders_active = false`). |
+        | `START` | Re-subscribe and reschedule all active medication reminders. |
+        | `H` or `HELP` | Reply with the command reference. |
+
+        Rate limited to 20 requests per minute per sender phone number.
+        Returns TwiML `<Response><Message>` XML on all code paths.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - From
+                - Body
+              properties:
+                From:
+                  type: string
+                  description: The sender's E.164 phone number, as supplied by Twilio.
+                  example: "+14155550101"
+                Body:
+                  type: string
+                  description: The raw SMS message body sent by the patient.
+                  example: "Y"
+      responses:
+        '200':
+          description: >
+            TwiML response instructing Twilio what message (if any) to send
+            back to the patient. Always returned as `text/xml`.
+          content:
+            text/xml:
+              schema:
+                type: string
+                description: A TwiML `<Response>` document.
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Response>
+                  <Message>Got it! Metformin 500 mg marked as taken. Keep it up!</Message>
+                </Response>
+        '403':
+          description: Twilio request-signature validation failed.
+          content:
+            text/xml:
+              schema:
+                type: string
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Response>
+                  <Message>Forbidden</Message>
+                </Response>
+        '429':
+          description: Rate limit exceeded for this sender phone number (20 req/min).
+          content:
+            text/xml:
+              schema:
+                type: string
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Response>
+                  <Message>Too many requests. Please wait a moment.</Message>
+                </Response>
