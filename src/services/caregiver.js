@@ -1,19 +1,18 @@
 'use strict';
-const pool = require('../db');
+const pool   = require('../db');
+const logger = require('../helpers/logger');
 const { sendSMS } = require('../helpers/twilio');
 
 /**
- * After a dose is marked skipped, count consecutive skipped doses for the patient
- * (skips since the last confirmation) and notify any active caregivers whose
- * threshold has been exactly reached.
+ * After a dose is skipped, count consecutive skips since the last confirmation
+ * and alert any active caregiver whose threshold has been exactly reached.
  *
- * Alerting at exactly `threshold` (rather than >=) prevents re-alerting the same
- * caregiver on every subsequent missed dose once the threshold is passed.
+ * Alerting at exactly `threshold` (not >=) prevents repeated alerts on every
+ * subsequent miss once the threshold is crossed.
  *
  * @param {number} patientId
  */
 async function checkAndAlertCaregivers(patientId) {
-  // Count skipped logs since the most recent confirmed log (or from the beginning).
   const missedResult = await pool.query(
     `SELECT COUNT(*) AS consecutive_missed
      FROM reminder_logs
@@ -30,7 +29,6 @@ async function checkAndAlertCaregivers(patientId) {
   const consecutiveMissed = Number(missedResult.rows[0].consecutive_missed);
   if (consecutiveMissed === 0) return;
 
-  // Fetch active caregivers whose threshold equals the current consecutive count.
   const caregiversResult = await pool.query(
     `SELECT c.*, p.name AS patient_name
      FROM caregivers c
@@ -49,14 +47,16 @@ async function checkAndAlertCaregivers(patientId) {
 
     try {
       await sendSMS(caregiver.phone, message);
-      console.log(
-        `[caregiver] Alert sent to ${caregiver.name} (${caregiver.phone}) ` +
-        `— patient=${patientId} consecutive_missed=${consecutiveMissed}`
-      );
+      logger.info('Caregiver alert sent', {
+        patientId,
+        caregiverId: caregiver.id,
+        consecutiveMissed,
+      });
     } catch (err) {
-      console.error(
-        `[caregiver] Failed to alert ${caregiver.phone}:`, err.message
-      );
+      logger.error('Failed to send caregiver alert', {
+        caregiverId: caregiver.id,
+        message: err.message,
+      });
     }
   }
 }

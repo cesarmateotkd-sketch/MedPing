@@ -1,46 +1,35 @@
 'use strict';
-const pool = require('../db');
+const pool   = require('../db');
+const logger = require('../helpers/logger');
 
 /**
  * Return the ISO-8601 Monday (YYYY-MM-DD) of the week containing `date`,
- * evaluated in the given IANA timezone so the week boundary matches the
- * patient's local calendar rather than UTC.
+ * evaluated in the patient's IANA timezone so the week boundary matches
+ * the patient's local calendar, not UTC.
  *
- * @param {string} [timezone='UTC'] - IANA timezone (e.g. 'America/New_York').
+ * @param {string} [timezone='UTC']
  * @param {Date}   [date=new Date()]
  * @returns {string} YYYY-MM-DD
  */
 function getWeekStart(timezone = 'UTC', date = new Date()) {
-  // Resolve what "today" looks like in the patient's timezone.
-  // en-CA locale produces YYYY-MM-DD, which is safe to split on '-'.
   const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year:     'numeric',
-    month:    '2-digit',
-    day:      '2-digit',
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
   });
-
   const [year, month, day] = formatter.format(date).split('-').map(Number);
-
-  // Build a UTC noon Date for that local calendar date so DST doesn't shift the day.
   const localNoon = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
-
-  // getUTCDay() → 0=Sun … 6=Sat; shift so Mon=0, …, Sun=6
-  const offset = (localNoon.getUTCDay() + 6) % 7;
+  const offset = (localNoon.getUTCDay() + 6) % 7; // Mon=0 … Sun=6
   localNoon.setUTCDate(localNoon.getUTCDate() - offset);
   localNoon.setUTCHours(0, 0, 0, 0);
-
-  return localNoon.toISOString().slice(0, 10); // YYYY-MM-DD
+  return localNoon.toISOString().slice(0, 10);
 }
 
 /**
  * Recalculate and upsert the weekly adherence row for a patient.
- * Only logs with a resolved status (confirmed / skipped / snoozed) are counted.
- * "Awaiting" logs are excluded from both numerator and denominator.
+ * Only resolved logs (confirmed/skipped/snoozed) count; awaiting logs are excluded.
  *
  * @param {number} patientId
- * @param {string} weekStart - YYYY-MM-DD Monday of the week (patient's local tz).
- * @returns {Promise<number>} Updated adherence percentage (0–100).
+ * @param {string} weekStart - YYYY-MM-DD Monday of the week.
+ * @returns {Promise<number>} Adherence percentage (0–100).
  */
 async function updateWeeklyAdherence(patientId, weekStart) {
   const result = await pool.query(
@@ -55,9 +44,7 @@ async function updateWeeklyAdherence(patientId, weekStart) {
   );
 
   const { confirmed, total } = result.rows[0];
-  const pct = Number(total) > 0
-    ? (Number(confirmed) / Number(total)) * 100
-    : 0;
+  const pct = Number(total) > 0 ? (Number(confirmed) / Number(total)) * 100 : 0;
 
   await pool.query(
     `INSERT INTO adherence_weekly (patient_id, week_start, pct)
@@ -67,6 +54,7 @@ async function updateWeeklyAdherence(patientId, weekStart) {
     [patientId, weekStart, pct.toFixed(2)]
   );
 
+  logger.debug('Adherence updated', { patientId, weekStart, pct: pct.toFixed(2) });
   return pct;
 }
 

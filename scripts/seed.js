@@ -4,31 +4,17 @@ require('dotenv').config();
 const pool = require('../src/db');
 const { reminderQueue, scheduleReminder } = require('../src/queues/reminderQueue');
 
+// Use a real NANP number (non-555 exchange) so Twilio accepts it.
 const TEST_PATIENT = {
   name:     'Alice Johnson',
-  phone:    '+15551234567',
+  phone:    '+12128675309',   // 212-867-5309, valid NANP
   timezone: 'America/New_York',
 };
 
 const TEST_MEDICATIONS = [
-  {
-    name:          'Lisinopril',
-    dose:          '10mg',
-    reminder_time: '08:00',
-    food_note:     'Take with a full glass of water',
-  },
-  {
-    name:          'Metformin',
-    dose:          '500mg',
-    reminder_time: '12:30',
-    food_note:     'Take with food to reduce stomach upset',
-  },
-  {
-    name:          'Atorvastatin',
-    dose:          '20mg',
-    reminder_time: '21:00',
-    food_note:     'Take at bedtime',
-  },
+  { name: 'Lisinopril',   dose: '10mg',  reminder_time: '08:00', food_note: 'Take with a full glass of water' },
+  { name: 'Metformin',    dose: '500mg', reminder_time: '12:30', food_note: 'Take with food to reduce stomach upset' },
+  { name: 'Atorvastatin', dose: '20mg',  reminder_time: '21:00', food_note: 'Take at bedtime' },
 ];
 
 async function seed() {
@@ -38,46 +24,30 @@ async function seed() {
   try {
     await client.query('BEGIN');
 
-    // Remove existing test patient (cascades to medications, logs, etc.)
     await client.query('DELETE FROM patients WHERE phone = $1', [TEST_PATIENT.phone]);
 
-    // Insert patient
     const patientResult = await client.query(
-      `INSERT INTO patients (name, phone, timezone)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
+      `INSERT INTO patients (name, phone, timezone) VALUES ($1, $2, $3) RETURNING *`,
       [TEST_PATIENT.name, TEST_PATIENT.phone, TEST_PATIENT.timezone]
     );
     const patient = patientResult.rows[0];
-    console.log(`[seed] Created patient: ${patient.name} (id=${patient.id}, phone=${patient.phone})`);
+    console.log(`[seed] Patient: ${patient.name} (id=${patient.id})`);
 
-    // Insert medications
     const insertedMeds = [];
     for (const med of TEST_MEDICATIONS) {
       const medResult = await client.query(
         `INSERT INTO medications (patient_id, name, dose, reminder_time, food_note)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING *`,
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
         [patient.id, med.name, med.dose, med.reminder_time, med.food_note]
       );
-      const medication = medResult.rows[0];
-      insertedMeds.push({ medication, med });
-      console.log(
-        `[seed]   Medication: ${medication.name} ${medication.dose} ` +
-        `at ${medication.reminder_time} (id=${medication.id})`
-      );
+      insertedMeds.push({ medication: medResult.rows[0], med });
+      console.log(`[seed]   ${med.name} ${med.dose} at ${med.reminder_time}`);
     }
 
     await client.query('COMMIT');
 
-    // Schedule BullMQ repeating jobs (outside transaction — Redis calls)
     for (const { medication, med } of insertedMeds) {
-      await scheduleReminder(
-        patient.id,
-        medication.id,
-        med.reminder_time,
-        TEST_PATIENT.timezone
-      );
+      await scheduleReminder(patient.id, medication.id, med.reminder_time, TEST_PATIENT.timezone);
     }
 
     console.log('[seed] Done.');
@@ -88,7 +58,6 @@ async function seed() {
     client.release();
   }
 
-  // Close all connections cleanly so the process exits naturally.
   await reminderQueue.close();
   await pool.end();
 }

@@ -13,6 +13,12 @@ module.exports = {
   TWILIO_PHONE_NUMBER:  requireEnv('TWILIO_PHONE_NUMBER'),
   DATABASE_URL:         requireEnv('DATABASE_URL'),
   REDIS_URL:            requireEnv('REDIS_URL'),
-  PORT:                 process.env.PORT || 3000,
-  NODE_ENV:             process.env.NODE_ENV || 'development',
+
+  // Optional — API key for protecting REST endpoints.
+  // Must be set in production; in development access is allowed without it (with a warning).
+  API_KEY:   process.env.API_KEY   || null,
+
+  PORT:      process.env.PORT      || 3000,
+  NODE_ENV:  process.env.NODE_ENV  || 'development',
+  LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 };

@@ -5,7 +5,8 @@ const rateLimit    = require('express-rate-limit');
 const twilio       = require('twilio');
 const config       = require('../config');
 const pool         = require('../db');
-const { reminderQueue }         = require('../queues/reminderQueue');
+const logger       = require('../helpers/logger');
+const { reminderQueue, scheduleReminder } = require('../queues/reminderQueue');
 const { updateWeeklyAdherence, getWeekStart } = require('../services/adherence');
 const { checkAndAlertCaregivers }             = require('../services/caregiver');
 const asyncHandler = require('../helpers/asyncHandler');
@@ -14,7 +15,6 @@ const asyncHandler = require('../helpers/asyncHandler');
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Build a TwiML MessagingResponse XML string. */
 function twiml(message) {
   const resp = new twilio.twiml.MessagingResponse();
   resp.message(message);
@@ -22,13 +22,13 @@ function twiml(message) {
 }
 
 /**
- * Rate limit by the sender's phone number (From field in Twilio body).
- * Falls back to IP when From is not yet parsed. The urlencoded parser in
- * app.js runs before all routes so req.body is populated here.
+ * Rate-limit by the sender's From phone number.
+ * The urlencoded body parser in app.js runs before all routes so req.body
+ * is already populated here.
  */
 const smsLimiter = rateLimit({
-  windowMs: 60 * 1000,    // 1-minute window
-  max:      20,           // max 20 inbound messages per phone per minute
+  windowMs:     60 * 1000,
+  max:          20,
   keyGenerator: (req) => req.body?.From || req.ip,
   standardHeaders: true,
   legacyHeaders:   false,
@@ -38,7 +38,7 @@ const smsLimiter = rateLimit({
 
 /**
  * Validate the Twilio request signature.
- * Set SKIP_TWILIO_VALIDATION=true in .env for local testing without ngrok.
+ * Set SKIP_TWILIO_VALIDATION=true in .env for local dev without ngrok.
  * Never set it in production.
  */
 function validateTwilioSignature(req, res, next) {
@@ -46,22 +46,15 @@ function validateTwilioSignature(req, res, next) {
     return next();
   }
 
-  const authToken  = config.TWILIO_AUTH_TOKEN;
-  const signature  = req.headers['x-twilio-signature'] || '';
-
-  // Reconstruct the full public URL (works behind ngrok / reverse-proxies).
+  const signature = req.headers['x-twilio-signature'] || '';
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
   const host  = req.headers['x-forwarded-host']  || req.get('host');
   const url   = `${proto}://${host}${req.originalUrl}`;
 
-  if (!twilio.validateRequest(authToken, signature, url, req.body)) {
-    console.warn(`[sms] Invalid Twilio signature — ip=${req.ip} url=${url}`);
-    return res
-      .status(403)
-      .type('text/xml')
-      .send(twiml('Forbidden'));
+  if (!twilio.validateRequest(config.TWILIO_AUTH_TOKEN, signature, url, req.body)) {
+    logger.warn('Invalid Twilio signature', { ip: req.ip, url });
+    return res.status(403).type('text/xml').send(twiml('Forbidden'));
   }
-
   next();
 }
 
@@ -81,41 +74,55 @@ router.post(
       return res.type('text/xml').send(twiml('Invalid request.'));
     }
 
-    // Look up patient by phone number (Twilio sends E.164).
     const patientResult = await pool.query(
       'SELECT * FROM patients WHERE phone = $1',
       [from]
     );
-
     if (patientResult.rows.length === 0) {
-      return res.type('text/xml').send(
-        twiml('Your number is not registered with MedPing.')
-      );
+      return res.type('text/xml').send(twiml('Your number is not registered with MedPing.'));
     }
 
     const patient = patientResult.rows[0];
 
     // ------------------------------------------------------------------
-    // STOP — unsubscribe
+    // STOP
     // ------------------------------------------------------------------
     if (cmd === 'STOP') {
       await pool.query(
         'UPDATE patients SET reminders_active = FALSE WHERE id = $1',
         [patient.id]
       );
+      logger.info('Patient unsubscribed', { patientId: patient.id });
       return res.type('text/xml').send(
         twiml('You have been unsubscribed from MedPing reminders. Reply START to re-enable.')
       );
     }
 
     // ------------------------------------------------------------------
-    // START — re-subscribe
+    // START — re-enable AND re-schedule all active medication jobs
     // ------------------------------------------------------------------
     if (cmd === 'START') {
       await pool.query(
         'UPDATE patients SET reminders_active = TRUE WHERE id = $1',
         [patient.id]
       );
+
+      // Re-create the BullMQ repeating jobs that were cancelled on STOP.
+      const medsResult = await pool.query(
+        `SELECT id, reminder_time FROM medications
+         WHERE patient_id = $1 AND active = TRUE`,
+        [patient.id]
+      );
+      for (const med of medsResult.rows) {
+        // reminder_time comes back as "HH:MM:SS" from pg — trim to "HH:MM".
+        const t = String(med.reminder_time).slice(0, 5);
+        await scheduleReminder(patient.id, med.id, t, patient.timezone);
+      }
+
+      logger.info('Patient re-subscribed and jobs re-scheduled', {
+        patientId: patient.id,
+        medicationCount: medsResult.rowCount,
+      });
       return res.type('text/xml').send(
         twiml('MedPing reminders re-enabled. You will receive your scheduled medication reminders.')
       );
@@ -195,19 +202,17 @@ router.post(
       );
     }
 
-    const log = logResult.rows[0];
-    // Use the patient's timezone so the week boundary matches their local calendar.
+    const log       = logResult.rows[0];
     const weekStart = getWeekStart(patient.timezone);
-    let reply = '';
+    let reply       = '';
 
     if (cmd === 'Y' || cmd === 'YES') {
       await pool.query(
-        `UPDATE reminder_logs
-         SET status = 'confirmed', confirmed_at = NOW()
-         WHERE id = $1`,
+        `UPDATE reminder_logs SET status = 'confirmed', confirmed_at = NOW() WHERE id = $1`,
         [log.id]
       );
       await updateWeeklyAdherence(patient.id, weekStart);
+      logger.info('Dose confirmed', { patientId: patient.id, logId: log.id });
       reply = `Got it! ${log.med_name} ${log.dose} marked as taken. Keep it up!`;
 
     } else if (cmd === 'S' || cmd === 'SNOOZE') {
@@ -215,7 +220,6 @@ router.post(
         `UPDATE reminder_logs SET status = 'snoozed' WHERE id = $1`,
         [log.id]
       );
-      // One-time delayed job — not a repeating job.
       await reminderQueue.add(
         'send-reminder',
         { patientId: patient.id, medicationId: log.medication_id },
@@ -230,6 +234,7 @@ router.post(
       );
       await updateWeeklyAdherence(patient.id, weekStart);
       await checkAndAlertCaregivers(patient.id);
+      logger.info('Dose skipped', { patientId: patient.id, logId: log.id });
       reply = `${log.med_name} marked as skipped for now.`;
 
     } else {
